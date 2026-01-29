@@ -157,13 +157,15 @@ class TableInvoiceOCR:
             else:
                 doc = Img2TableImage(src=file_path)
 
-            # Extract tables with OCR - simple parameters for compatibility
+            # Extract tables with OCR - handle different API versions
+            tables = None
             try:
-                tables = doc.extract_tables(ocr=self.ocr, implicit_rows=True)
-            except TypeError:
-                # Fallback for different API versions
                 tables = doc.extract_tables(ocr=self.ocr)
+            except Exception as e:
+                logger.warning(f"Table extraction error: {e}")
 
+            if tables is None:
+                tables = []
             logger.info(f"Found {len(tables)} tables in document")
 
             for table in tables:
