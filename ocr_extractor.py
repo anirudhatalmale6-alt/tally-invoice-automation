@@ -375,34 +375,68 @@ class InvoiceOCR:
         """Extract line items from invoice"""
         items = []
 
-        # Look for item patterns
-        # Pattern: Item code (optional), Description, Qty, Unit, Rate, Amount
-        item_pattern = r'(\d{4,6})?\s*([A-Za-z][A-Za-z\s\-\d\.]+?)\s+(\d+\.?\d*)\s*(NOS|PCS|KG|MTR|LTR|DRUM|BOX|SET|EA|EACH|UNIT)?\s*(\d+\.?\d*)\s+(\d+\.?\d*)'
+        # Multiple item patterns to try
+        item_patterns = [
+            # Pattern 1: Item code, Description, Unit, Qty, Unit Price, Amount, VAT, Total
+            # e.g., "14504 Bitumen Polycoat WB 200ltr Henkel DRUM 1.00 330.00 330.00"
+            r'(\d{4,6})\s+([A-Za-z][A-Za-z\s\-\d\./\'\"]+?)\s+(DRUM|NOS|PCS|KG|MTR|LTR|BOX|SET|EA|EACH|UNIT)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
 
-        matches = re.findall(item_pattern, text, re.IGNORECASE)
+            # Pattern 2: Item code, Description, Qty, Unit, Rate, Amount
+            r'(\d{4,6})\s+([A-Za-z][A-Za-z\s\-\d\./\'\"]+?)\s+(\d+\.?\d*)\s+(DRUM|NOS|PCS|KG|MTR|LTR|BOX|SET|EA|EACH|UNIT)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
 
-        for match in matches:
-            item_code, description, qty, unit, rate, amount = match
+            # Pattern 3: Description, Qty, Unit, Rate, Amount (no item code)
+            r'([A-Za-z][A-Za-z\s\-\d\./\'\"]{5,40}?)\s+(\d+\.?\d*)\s+(DRUM|NOS|PCS|KG|MTR|LTR|BOX|SET|EA|EACH|UNIT)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
 
-            # Validate - skip if it looks like a total or header
-            if any(skip in description.upper() for skip in ['TOTAL', 'SUBTOTAL', 'VAT', 'TAX', 'DISCOUNT']):
-                continue
+            # Pattern 4: Simple - Description followed by numbers
+            r'([A-Za-z][A-Za-z\s\-\d\./\'\"]{5,40}?)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
+        ]
 
-            try:
-                item = InvoiceItem(
-                    item_code=item_code.strip() if item_code else "",
-                    description=description.strip(),
-                    quantity=float(qty) if qty else 0,
-                    unit=unit.upper() if unit else "NOS",
-                    rate=float(rate) if rate else 0,
-                    amount=float(amount) if amount else 0,
-                )
+        for pattern_idx, pattern in enumerate(item_patterns):
+            matches = re.findall(pattern, text, re.IGNORECASE)
 
-                # Validate the item
-                if item.description and (item.quantity > 0 or item.amount > 0):
-                    items.append(item)
-            except (ValueError, AttributeError):
-                continue
+            for match in matches:
+                try:
+                    if pattern_idx == 0:  # Pattern with unit before qty
+                        item_code, description, unit, qty, rate, amount = match
+                    elif pattern_idx == 1:  # Pattern with qty before unit
+                        item_code, description, qty, unit, rate, amount = match
+                    elif pattern_idx == 2:  # No item code, qty before unit
+                        item_code = ""
+                        description, qty, unit, rate, amount = match
+                    else:  # Simple pattern
+                        item_code = ""
+                        unit = "NOS"
+                        description, qty, rate, amount = match
+
+                    # Validate - skip if it looks like a total or header
+                    if any(skip in description.upper() for skip in ['TOTAL', 'SUBTOTAL', 'VAT', 'TAX', 'DISCOUNT', 'AMOUNT', 'QUANTITY', 'PRICE']):
+                        continue
+
+                    item = InvoiceItem(
+                        item_code=item_code.strip() if item_code else "",
+                        description=description.strip(),
+                        quantity=float(qty) if qty else 0,
+                        unit=unit.upper() if unit else "NOS",
+                        rate=float(rate) if rate else 0,
+                        amount=float(amount) if amount else 0,
+                    )
+
+                    # Validate the item - must have description and reasonable values
+                    if item.description and len(item.description) > 3 and item.quantity > 0 and item.amount > 0:
+                        # Check for duplicates
+                        is_duplicate = False
+                        for existing in items:
+                            if existing.description == item.description and existing.amount == item.amount:
+                                is_duplicate = True
+                                break
+                        if not is_duplicate:
+                            items.append(item)
+                except (ValueError, AttributeError, IndexError):
+                    continue
+
+            # If we found items with this pattern, don't try other patterns
+            if len(items) >= 1:
+                break
 
         # Alternative parsing for simpler invoices
         if not items:
