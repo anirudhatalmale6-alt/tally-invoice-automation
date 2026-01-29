@@ -21,7 +21,17 @@ from config import (
     INVOICE_FOLDER, SUPPORTED_FORMATS, OUTPUT_FOLDER, FLAGGED_FOLDER,
     LOG_FILE, LOG_LEVEL, OCR_CONFIDENCE_THRESHOLD
 )
-from ocr_extractor import InvoiceOCR, InvoiceData, process_invoice
+
+# Try table extractor first (better for structured invoices)
+try:
+    from table_extractor import TableInvoiceOCR, InvoiceData, process_invoice
+    USE_TABLE_OCR = True
+    logger_init = logging.getLogger(__name__)
+    logger_init.info("Using table-based OCR extraction")
+except ImportError:
+    from ocr_extractor import InvoiceOCR, InvoiceData, process_invoice
+    USE_TABLE_OCR = False
+
 from tally_api import TallyAPI, TallyConnectionError
 from voucher_creator import PurchaseVoucherCreator, VoucherResult
 
@@ -81,8 +91,12 @@ class InvoiceProcessor:
 
         # Initialize OCR
         try:
-            self.ocr = InvoiceOCR()
-            logger.info("OCR engine initialized")
+            if USE_TABLE_OCR:
+                self.ocr = TableInvoiceOCR()
+                logger.info("Table-based OCR engine initialized")
+            else:
+                self.ocr = InvoiceOCR()
+                logger.info("Standard OCR engine initialized")
         except Exception as e:
             logger.error(f"Failed to initialize OCR: {e}")
             return False
