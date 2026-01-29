@@ -25,6 +25,12 @@ except ImportError:
     TESSERACT_AVAILABLE = False
 
 try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+
+try:
     import pdf2image
     PDF2IMAGE_AVAILABLE = True
 except ImportError:
@@ -79,6 +85,13 @@ class TableInvoiceOCR:
             raise RuntimeError("Tesseract is required. Install pytesseract.")
         if not CV2_AVAILABLE:
             raise RuntimeError("OpenCV is required. Install opencv-python.")
+        self.easyocr_reader = None
+        if EASYOCR_AVAILABLE:
+            try:
+                self.easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                logger.info("EasyOCR initialized for handwritten text")
+            except Exception as e:
+                logger.warning(f"Failed to initialize EasyOCR: {e}")
         logger.info("Table OCR initialized with OpenCV and Tesseract")
 
     def extract_from_file(self, file_path: str) -> InvoiceData:
@@ -181,50 +194,92 @@ class TableInvoiceOCR:
         table_rows = self._extract_table_with_positions(img)
         logger.info(f"Found {len(table_rows)} rows with position-based OCR")
 
-        # Debug: log all rows
-        for i, row in enumerate(table_rows):
-            logger.debug(f"Row {i}: {row}")
+        # Media General format columns: S.No | Item Code | Description | Unit | Qty | Disc% | Rate | VAT | Amount (incl VAT)
+        # We want: item_code, description, qty, unit, rate (before VAT), amount (before VAT)
 
-        # Media General format columns: S.No | Item Code | Description | Unit | Qty | Rate | Amount
-        # Try to identify item rows (rows with item codes - 5-digit numbers)
         for row in table_rows:
             row_text = ' '.join(row)
 
-            # Skip header/footer rows
-            if any(skip in row_text.upper() for skip in [
-                'ITEM CODE', 'DESCRIPTION', 'TOTAL', 'VAT', 'SUBTOTAL', 'NET AMOUNT',
-                'GRAND', 'THANK', 'BANK', 'IBAN', 'TRN', 'ADDRESS'
-            ]):
+            # Skip header/footer rows - be more strict
+            skip_patterns = [
+                'ITEM CODE', 'DESCRIPTION', 'TOTAL', 'VAT 5', 'SUBTOTAL', 'NET AMOUNT',
+                'GRAND', 'THANK', 'BANK', 'IBAN', 'TRN', 'ADDRESS', 'P.O.', 'PO BOX',
+                'INVOICE', 'DATE', 'CUSTOMER', 'CERTIFIED', 'ISO', 'DISCOUNT',
+                'SOLD GOODS', 'EXCHANGE', 'WWW.', 'HTTP', 'EMAIL', 'MOB.', 'TEL.',
+                'RECEIVER', 'SIGNATURE', 'STAMP', 'AUTHORISED', 'SUPPLY', 'LPO',
+                'D.O.', 'TRADING LLC', 'BUILDING MATERIAL', 'CEMENT PRODUCT'
+            ]
+            if any(skip in row_text.upper() for skip in skip_patterns):
                 continue
 
-            # Find numbers in this row
-            numbers = []
-            texts = []
-            for cell in row:
-                # Try to parse as number
-                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0')
+            # Check if this looks like an item row:
+            # Must have a 5-digit item code (10000-99999)
+            has_item_code = False
+            item_code = ""
+            item_code_pos = -1
+
+            for i, cell in enumerate(row):
+                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0').strip()
                 try:
                     num = float(cell_clean)
-                    numbers.append(num)
+                    if 10000 <= num <= 99999:
+                        has_item_code = True
+                        item_code = str(int(num))
+                        item_code_pos = i
+                        break
                 except ValueError:
-                    # Check if it's a partial number with text
-                    num_match = re.search(r'(\d+\.?\d*)', cell_clean)
-                    if num_match:
-                        numbers.append(float(num_match.group(1)))
-                    texts.append(cell)
+                    pass
 
-            # Valid item row should have at least 3 numbers (qty, rate, amount) or (code, qty, rate, amount)
+            if not has_item_code:
+                continue
+
+            # Parse all cells, keeping track of positions
+            numbers = []
+            number_positions = []
+            texts = []
+            text_positions = []
+
+            for i, cell in enumerate(row):
+                if i == item_code_pos:
+                    continue  # Skip the item code we already extracted
+
+                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0').replace('[', '').replace(']', '').strip()
+
+                # Check for pipe character (OCR artifact)
+                if cell_clean == '|':
+                    continue
+
+                try:
+                    num = float(cell_clean)
+                    if 0 < num < 100000:
+                        numbers.append(num)
+                        number_positions.append(i)
+                except ValueError:
+                    # Check for number embedded in text
+                    num_match = re.match(r'^(\d+\.?\d*)$', cell_clean)
+                    if num_match:
+                        val = float(num_match.group(1))
+                        if 0 < val < 100000:
+                            numbers.append(val)
+                            number_positions.append(i)
+                    elif len(cell) >= 2:
+                        texts.append(cell)
+                        text_positions.append(i)
+
+            # Need at least Qty, Rate, Amount (3 numbers minimum after item code)
             if len(numbers) < 3:
                 continue
 
-            # Build description from text parts
+            # Build description from text parts, excluding units
             desc_parts = []
             for t in texts:
-                # Skip units and very short strings
-                if t.upper() in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'PKT', 'BAG', 'NO', 'S']:
+                t_upper = t.upper().strip()
+                if t_upper in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'PKT', 'BAG', 'NO', 'S', '|']:
                     continue
-                if len(t) >= 2:
-                    desc_parts.append(t)
+                # Skip serial numbers (single digits)
+                if re.match(r'^\d$', t.strip()):
+                    continue
+                desc_parts.append(t)
 
             description = ' '.join(desc_parts).strip()
 
@@ -239,46 +294,87 @@ class TableInvoiceOCR:
                     unit = u
                     break
 
-            # Extract item code if present (usually 5-digit number at start)
-            item_code = ""
-            for num in numbers:
-                if 10000 <= num <= 99999:  # 5-digit item code
-                    item_code = str(int(num))
-                    numbers.remove(num)
-                    break
+            # Media General columns: S.No | Item Code | Description | Unit | Qty | Unit Price | Amount Excl.VAT | VAT 5% | Total Amount
+            # After extracting item_code, numbers should be: S.No, Qty, UnitPrice, AmountExclVAT, VAT, TotalAmount
+            # We want: Qty, Rate (unit price), Amount (excl VAT)
 
-            # Assign remaining numbers to qty, rate, amount
-            # Filter out unlikely values
-            valid_nums = [n for n in numbers if 0 < n < 100000]
+            # Sort numbers by their original position (left to right in table)
+            num_with_pos = list(zip(numbers, number_positions))
+            num_with_pos.sort(key=lambda x: x[1])
+            sorted_numbers = [n for n, p in num_with_pos]
 
-            if len(valid_nums) >= 3:
-                # Assume last 3 are qty, rate, amount
-                qty = valid_nums[-3]
-                rate = valid_nums[-2]
-                amount = valid_nums[-1]
-            elif len(valid_nums) == 2:
-                qty = valid_nums[0]
-                amount = valid_nums[1]
-                rate = amount / qty if qty > 0 else 0
+            logger.debug(f"Sorted numbers for {item_code}: {sorted_numbers}")
+
+            # First number is likely row number (1-10) - skip if very small
+            if sorted_numbers[0] <= 10 and len(sorted_numbers) > 3:
+                sorted_numbers = sorted_numbers[1:]
+
+            # Now expect: Qty, UnitPrice, AmountExclVAT, VAT, TotalAmount
+            # Or possibly: Qty, UnitPrice, AmountExclVAT, VAT, Total (sometimes columns merge)
+
+            # Strategy: Find the largest reasonable number which is likely Total or Amount
+            # Then work backwards
+
+            qty = sorted_numbers[0]  # First is quantity
+
+            # Look for unit price (should be > 0.1, and Amount = Qty * UnitPrice approximately)
+            # The amount before VAT should be in there somewhere
+
+            if len(sorted_numbers) >= 4:
+                # Likely have: Qty, UnitPrice, AmountExclVAT, VAT or more
+                # Unit Price is second number
+                rate = sorted_numbers[1]
+
+                # Amount should be Qty * Rate (with small tolerance for rounding)
+                expected_amount = qty * rate
+
+                # Find the number closest to expected_amount
+                amount = expected_amount  # Default
+                for n in sorted_numbers[2:]:
+                    if abs(n - expected_amount) < expected_amount * 0.1:  # Within 10%
+                        amount = n
+                        break
+                else:
+                    # If no exact match, use calculated amount
+                    amount = round(qty * rate, 2)
+
+            elif len(sorted_numbers) == 3:
+                # Qty, Rate, Amount
+                rate = sorted_numbers[1]
+                amount = sorted_numbers[2]
+
+                # Validate: amount should be close to qty * rate
+                if abs(amount - qty * rate) > amount * 0.2:  # More than 20% off
+                    # Maybe the last number is total with VAT
+                    amount = sorted_numbers[2] / 1.05
+
             else:
-                continue
+                # Only 2 numbers: Qty and something else
+                rate = sorted_numbers[1] / qty if qty > 0 else sorted_numbers[1]
+                amount = sorted_numbers[1]
 
-            # Validate: qty should be reasonable (< 1000), amount should match roughly
-            if qty > 1000:
-                # Maybe qty and amount are swapped
-                if amount < 100:
-                    qty, amount = amount, qty
-                    rate = amount / qty if qty > 0 else 0
+            # Special handling: if qty looks too large (> 1000) and amount is small
+            # the columns might be misread
+            if qty > 500 and rate < 1:
+                # This looks right for bulk items (500 spacers @ 0.25 = 125)
+                pass
+            elif qty > 1000:
+                # Probably misread
+                logger.warning(f"Unusual qty {qty} for {item_code}, using calculated values")
+                if len(sorted_numbers) >= 3:
+                    qty = sorted_numbers[0]
+                    rate = sorted_numbers[1]
+                    amount = qty * rate
 
             items.append(InvoiceItem(
                 item_code=item_code,
                 description=description,
-                quantity=qty,
+                quantity=round(qty, 2),
                 unit=unit,
-                rate=rate,
-                amount=amount
+                rate=round(rate, 2),
+                amount=round(amount, 2)
             ))
-            logger.info(f"Found item: {item_code} | {description} | Qty: {qty} | Rate: {rate} | Amount: {amount}")
+            logger.info(f"Found item: {item_code} | {description} | Qty: {qty} | Rate: {round(rate,2)} | Amount: {round(amount,2)}")
 
         if items:
             return items
@@ -468,105 +564,389 @@ class TableInvoiceOCR:
         items = []
         logger.info("Using Laspinas extraction pattern")
 
-        # Laspinas format: No. | Code No. | Description | Qty. | Unit | Rate | Amount Excl. VAT | VAT Amount | Total
-        # Pattern: digits followed by description, then qty/unit/rate/amount
+        # First try position-based table extraction
+        table_rows = self._extract_table_with_positions(img)
+        logger.info(f"Found {len(table_rows)} rows with position-based OCR")
 
-        # Look for item patterns
-        patterns = [
-            # With code number
-            r'(\d{3,})\s+([A-Z][A-Z\s\d]+?)\s+(\d+\.?\d*)\s+(BAG|PCS|NOS|KG|MTR|BOX)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
-            # Without explicit code
-            r'([A-Z][A-Z\s\d]{5,40}?)\s+(\d+\.?\d*)\s+(BAG|PCS|NOS|KG|MTR|BOX)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
-        ]
+        # Laspinas format: No. | Code No. | Description | Qty | Unit | Rate | Amount Excl. VAT | VAT Amount | Total with VAT
 
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                try:
-                    if len(match) == 6:
-                        code, desc, qty, unit, rate, amount = match
-                    else:
-                        code = ""
-                        desc, qty, unit, rate, amount = match
+        for row in table_rows:
+            row_text = ' '.join(row)
 
-                    # Skip headers/footers
-                    if any(skip in desc.upper() for skip in ['TOTAL', 'VAT', 'DESCRIPTION', 'AMOUNT', 'TRANSPORT']):
-                        continue
+            # Skip header/footer rows
+            skip_patterns = [
+                'DESCRIPTION', 'CODE NO', 'TOTAL', 'TRANSPORT', 'ADJUSTMENT', 'GRAND',
+                'TRN', 'CUSTOMER', 'TELEPHONE', 'REFERENCE', 'DATE', 'INVOICE',
+                'RECEIVER', 'SIGNATURE', 'VEHICLE', 'DRIVER', 'D.O.', 'AMOUNT',
+                'BUILDING MATERIAL', 'TRADING', 'EMAIL', 'TEL:', 'FAX:', 'P.O.BOX',
+                'HUNDRED', 'THOUSAND', 'ONLY', 'CASH', 'VAT 5', 'EXCL', 'IN AED'
+            ]
+            if any(skip in row_text.upper() for skip in skip_patterns):
+                continue
 
-                    items.append(InvoiceItem(
-                        item_code=str(code).strip(),
-                        description=desc.strip(),
-                        quantity=float(qty),
-                        unit=unit.upper(),
-                        rate=float(rate),
-                        amount=float(amount)
-                    ))
-                except (ValueError, IndexError):
+            # Laspinas items typically have product names in CAPS with numbers
+            # Look for rows with product keywords
+            product_keywords = ['WEBER', 'PLUS', 'WHITE', 'KG', 'SWITCH', 'PROOF', 'WATER', 'TILE', 'CEMENT', 'PAINT', 'BRUSH']
+            has_product = any(kw in row_text.upper() for kw in product_keywords)
+
+            if not has_product:
+                continue
+
+            # Parse numbers and texts
+            numbers = []
+            texts = []
+
+            for cell in row:
+                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0').replace('|', '').replace('[', '').replace(']', '').strip()
+
+                if not cell_clean:
                     continue
 
-            if items:
-                break
+                try:
+                    num = float(cell_clean)
+                    if 0 < num < 100000:
+                        numbers.append(num)
+                except ValueError:
+                    num_match = re.match(r'^(\d+\.?\d*)$', cell_clean)
+                    if num_match:
+                        val = float(num_match.group(1))
+                        if 0 < val < 100000:
+                            numbers.append(val)
+                    elif len(cell) >= 2:
+                        texts.append(cell)
 
-        if not items:
-            items = self._extract_generic(img, text)
+            # Need at least 3 numbers (Qty, Rate, Amount)
+            if len(numbers) < 3:
+                continue
 
-        return items
+            # Build description from text parts
+            desc_parts = []
+            for t in texts:
+                t_upper = t.upper().strip()
+                if t_upper in ['BAG', 'PCS', 'NOS', 'KG', 'MTR', 'BOX', 'SET', 'PKT', 'GA', 'FA', '||']:
+                    continue
+                desc_parts.append(t)
+
+            description = ' '.join(desc_parts).strip()
+
+            if len(description) < 3:
+                continue
+
+            # Identify unit
+            unit = "NOS"
+            for u in ['BAG', 'PCS', 'NOS', 'KG', 'MTR', 'BOX', 'SET', 'PKT']:
+                if u in row_text.upper():
+                    unit = u
+                    break
+
+            # Column assignment: Qty, Rate, Amount_excl_vat, VAT_amount, Total
+            # First small number is usually Qty
+            # Then Rate, then larger numbers
+
+            qty = numbers[0]
+            rate = numbers[1] if len(numbers) > 1 else 0
+            amount = numbers[2] if len(numbers) > 2 else qty * rate
+
+            # Validate: amount should be close to qty * rate
+            expected = qty * rate
+            if len(numbers) >= 3 and abs(amount - expected) > expected * 0.2:
+                # Maybe first number wasn't qty - try different assignment
+                if numbers[0] > 50 and len(numbers) >= 4:
+                    # First might be a code, not qty
+                    qty = numbers[1]
+                    rate = numbers[2]
+                    amount = numbers[3] if len(numbers) > 3 else qty * rate
+
+            items.append(InvoiceItem(
+                description=description,
+                quantity=round(qty, 2),
+                unit=unit,
+                rate=round(rate, 2),
+                amount=round(amount, 2)
+            ))
+            logger.info(f"Found item: {description} | Qty: {qty} | Rate: {rate} | Amount: {amount}")
+
+        if items:
+            return items
+
+        # Fallback to generic extraction
+        logger.info("Position-based extraction found no items, using generic fallback")
+        return self._extract_generic(img, text)
 
     def _extract_al_junaibi(self, img: np.ndarray, text: str) -> List[InvoiceItem]:
         """Extract items from Al Junaibi Building Materials invoices"""
         items = []
         logger.info("Using Al Junaibi extraction pattern")
 
-        # Al Junaibi format is very clean: Item No. | Description | Unit | Qty | Rate | Vat 5% | Amount
-        # Example: 1 | TILE SPACER CLIP 2MM 100 PCS/PKT 01 | PKT | 1.00 | 10.00 | 0.50 | 10.00
+        # First try position-based extraction
+        table_rows = self._extract_table_with_positions(img)
+        logger.info(f"Found {len(table_rows)} rows with position-based OCR")
 
-        # Pattern for Al Junaibi items
-        pattern = r'(\d+)\s+([A-Z][A-Z\s\d/]+?)\s+(PKT|PCS|NOS|KG|MTR|BOX|SET)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)'
+        # Al Junaibi format: Item No. | Description | Unit | Qty | Rate | Vat 5% | Amount
+        # Look for rows with product keywords
 
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        for match in matches:
-            try:
-                item_no, desc, unit, qty, rate, vat, amount = match
+        for row in table_rows:
+            row_text = ' '.join(row)
 
-                # Skip headers
-                if any(skip in desc.upper() for skip in ['DESCRIPTION', 'ITEM NO', 'RATE', 'AMOUNT']):
-                    continue
-
-                items.append(InvoiceItem(
-                    item_code=item_no.strip(),
-                    description=desc.strip(),
-                    quantity=float(qty),
-                    unit=unit.upper(),
-                    rate=float(rate),
-                    amount=float(amount)
-                ))
-            except (ValueError, IndexError):
+            # Skip header/footer rows
+            skip_patterns = [
+                'ITEM NO', 'DESCRIPTION', 'UNIT', 'RATE', 'VAT 5%', 'AMOUNT', 'TOTAL',
+                'GROSS', 'DISCOUNT', 'TRN', 'DATE', 'PAGE', 'SITE', 'EMAIL', 'TEL',
+                'JUNAIBI', 'BUILDING', 'MATERIALS', 'SANITARY', 'PLUMBING', 'ELECTRICAL',
+                'GYPSUM', 'ACCESS', 'CERAMICS', 'SCAFFOLDING', 'INVOICE', 'HUSSAIN',
+                'DHS.', 'ONLY', 'FOR AL'
+            ]
+            if any(skip in row_text.upper() for skip in skip_patterns):
                 continue
 
-        if not items:
-            items = self._extract_generic(img, text)
+            # Product keywords for Al Junaibi
+            product_keywords = ['TILE', 'SPACER', 'CLIP', 'PCS', 'PKT', 'CEMENT', 'GROUT', 'ADHESIVE', 'PAINT']
+            has_product = any(kw in row_text.upper() for kw in product_keywords)
 
-        return items
+            if not has_product:
+                continue
+
+            # Parse numbers and texts
+            numbers = []
+            texts = []
+
+            for cell in row:
+                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0').replace(';', '').strip()
+
+                if not cell_clean:
+                    continue
+
+                try:
+                    num = float(cell_clean)
+                    if 0 < num < 100000:
+                        numbers.append(num)
+                except ValueError:
+                    num_match = re.match(r'^(\d+\.?\d*)$', cell_clean)
+                    if num_match:
+                        val = float(num_match.group(1))
+                        if 0 < val < 100000:
+                            numbers.append(val)
+                    elif len(cell) >= 2:
+                        texts.append(cell)
+
+            # Need at least qty and rate
+            if len(numbers) < 2:
+                continue
+
+            # Build description
+            desc_parts = []
+            for t in texts:
+                t_upper = t.upper().strip()
+                if t_upper in ['PKT', 'PCS', 'NOS', 'KG', 'MTR', 'BOX', 'SET', ';', '|']:
+                    continue
+                desc_parts.append(t)
+
+            description = ' '.join(desc_parts).strip()
+
+            if len(description) < 3:
+                continue
+
+            # Identify unit
+            unit = "NOS"
+            for u in ['PKT', 'PCS', 'NOS', 'KG', 'MTR', 'BOX', 'SET']:
+                if u in row_text.upper():
+                    unit = u
+                    break
+
+            # For Al Junaibi: numbers are typically [item_no, (100 from description), qty, rate, vat]
+            # OCR may misread numbers, so we'll use simpler logic
+
+            # Filter out very large numbers (probably from description like "100 PCS")
+            # and very small decimals (VAT amounts)
+            filtered_nums = []
+            for n in numbers:
+                if n >= 100 and n < 1000:
+                    continue  # Skip counts like "100 PCS"
+                if n < 0.1:
+                    continue  # Skip very small numbers
+                filtered_nums.append(n)
+
+            logger.debug(f"Filtered numbers: {filtered_nums}")
+
+            if len(filtered_nums) < 2:
+                filtered_nums = numbers  # Use all if filtering removed too many
+
+            # Qty is usually first decimal or small integer
+            # Rate is usually larger number
+            qty = 1.0
+            rate = 0.0
+
+            for n in filtered_nums:
+                if n >= 0.5 and n <= 100 and qty == 1.0:
+                    qty = n
+                elif n > 1 and rate == 0.0:
+                    rate = n
+
+            # If qty looks like it could be rate and rate looks like amount
+            if qty > 10 and rate > qty * 2:
+                # Swap - qty was actually rate
+                rate = qty
+                qty = 1.0
+
+            # Calculate amount
+            amount = qty * rate
+
+            items.append(InvoiceItem(
+                description=description,
+                quantity=round(qty, 2),
+                unit=unit,
+                rate=round(rate, 2),
+                amount=round(amount, 2)
+            ))
+            logger.info(f"Found item: {description} | Qty: {qty} | Rate: {rate} | Amount: {amount}")
+
+        if items:
+            return items
+
+        # Fallback to generic
+        logger.info("Position-based extraction found no items, using generic fallback")
+        return self._extract_generic(img, text)
 
     def _extract_mohammed_sofa(self, img: np.ndarray, text: str) -> List[InvoiceItem]:
-        """Extract items from Mohammed Sofa handwritten invoices"""
+        """Extract items from Mohammed Sofa handwritten invoices using EasyOCR"""
         items = []
         logger.info("Using Mohammed Sofa extraction pattern (handwritten)")
 
-        # Handwritten invoices are harder - look for lines with numbers
+        # Try EasyOCR for better handwritten text recognition
+        if self.easyocr_reader:
+            try:
+                results = self.easyocr_reader.readtext(img)
+                logger.info(f"EasyOCR found {len(results)} text regions")
+
+                # Group by Y coordinate (same row)
+                rows = {}
+                for bbox, text_val, conf in results:
+                    y_center = (bbox[0][1] + bbox[2][1]) / 2
+                    # Round to nearest 30 pixels to group
+                    row_key = int(y_center / 30) * 30
+                    if row_key not in rows:
+                        rows[row_key] = []
+                    rows[row_key].append({
+                        'text': text_val,
+                        'x': bbox[0][0],
+                        'conf': conf
+                    })
+
+                # Sort rows by Y and cells by X
+                sorted_rows = []
+                for y in sorted(rows.keys()):
+                    row_items = sorted(rows[y], key=lambda x: x['x'])
+                    row_text = [item['text'] for item in row_items]
+                    sorted_rows.append(row_text)
+
+                logger.info(f"Grouped into {len(sorted_rows)} rows")
+
+                # Look for item rows (contain product names and numbers)
+                for row in sorted_rows:
+                    row_joined = ' '.join(row)
+                    logger.debug(f"EasyOCR row: {row_joined}")
+
+                    # Skip headers/footers
+                    if any(skip in row_joined.upper() for skip in [
+                        'DESCRIPTION', 'TOTAL', 'VAT', 'GRAND', 'DATE', 'INVOICE',
+                        'TRN', 'CUSTOMER', 'RECEIVER', 'SIGNATURE', 'MOB', 'BOX',
+                        'SHARJAH', 'BEFORE', 'DISCOUNT', 'RATE', 'AMOUNT', 'QTY'
+                    ]):
+                        continue
+
+                    # Look for product keywords (including OCR misreads)
+                    product_keywords = ['ROLL', 'CEMENT', 'PLASTWICK', 'PLATIE', 'PLAST', 'CEMEL', 'PIPE', 'WIRE', 'CABLE', 'SWITCH', 'SOCKET']
+                    has_product = any(kw in row_joined.upper() for kw in product_keywords)
+
+                    if not has_product:
+                        continue
+
+                    # Parse numbers and texts
+                    numbers = []
+                    texts = []
+
+                    for cell in row:
+                        cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0').strip()
+
+                        try:
+                            num = float(cell_clean)
+                            if 0 < num < 50000:
+                                numbers.append(num)
+                        except ValueError:
+                            num_match = re.search(r'(\d+\.?\d*)', cell_clean)
+                            if num_match:
+                                val = float(num_match.group(1))
+                                if 0 < val < 50000:
+                                    numbers.append(val)
+                            if len(cell) >= 2:
+                                texts.append(cell)
+
+                    if len(numbers) < 2:
+                        continue
+
+                    # Build description
+                    desc_parts = []
+                    for t in texts:
+                        t_upper = t.upper().strip()
+                        if t_upper in ['P', 'NOS', 'PCS', 'KG', 'MTR', 'NO', 'QTY', 'RATE', 'VAT', 'AMOUNT']:
+                            continue
+                        if re.match(r'^\d+$', t.strip()):
+                            continue
+                        desc_parts.append(t)
+
+                    description = ' '.join(desc_parts).strip()
+
+                    if len(description) < 3:
+                        continue
+
+                    # Assign numbers: item_code (if 4-5 digits), qty, rate, vat, amount
+                    item_code = ""
+                    for n in numbers[:]:
+                        if 1000 <= n <= 99999:
+                            item_code = str(int(n))
+                            numbers.remove(n)
+                            break
+
+                    # Remaining numbers: qty, rate, vat, amount
+                    if len(numbers) >= 3:
+                        qty = numbers[0]
+                        rate = numbers[1]
+                        amount = numbers[-1]
+                    elif len(numbers) == 2:
+                        qty = numbers[0]
+                        amount = numbers[1]
+                        rate = amount / qty if qty > 0 else 0
+                    else:
+                        continue
+
+                    items.append(InvoiceItem(
+                        item_code=item_code,
+                        description=description,
+                        quantity=round(qty, 2),
+                        unit="NOS",
+                        rate=round(rate, 2),
+                        amount=round(amount, 2)
+                    ))
+                    logger.info(f"Found item: {item_code} | {description} | Qty: {qty} | Rate: {rate} | Amount: {amount}")
+
+                if items:
+                    return items
+
+            except Exception as e:
+                logger.warning(f"EasyOCR extraction failed: {e}")
+
+        # Fallback to Tesseract-based extraction
+        logger.info("Falling back to Tesseract for handwritten extraction")
         lines = text.split('\n')
 
         for line in lines:
-            # Skip headers and footers
             if any(skip in line.upper() for skip in ['DESCRIPTION', 'TOTAL', 'VAT', 'DISCOUNT', 'GRAND', 'DATE', 'INVOICE', 'TRN', 'CUSTOMER', 'RECEIVER']):
                 continue
 
-            # Look for lines with multiple numbers (qty, rate, amount pattern)
             numbers = re.findall(r'(\d+\.?\d*)', line)
             numbers = [float(n) for n in numbers if 0 < float(n) < 50000]
 
             if len(numbers) >= 3:
-                # Extract description (text part)
                 desc_match = re.search(r'([A-Za-z][A-Za-z\s\-\.]+)', line)
                 if desc_match:
                     desc = desc_match.group(1).strip()
@@ -770,6 +1150,24 @@ class TableInvoiceOCR:
             lines.append(current_line)
 
         return lines
+
+    def _extract_invoice_total(self, text: str) -> float:
+        """Extract the total amount from invoice text"""
+        patterns = [
+            r'(?:NET\s*AMOUNT|GRAND\s*TOTAL|TOTAL)\s*:?\s*(\d+[,\d]*\.?\d*)',
+            r'Total\s+(\d+\.?\d*)',
+            r'(\d+\.?\d*)\s*$',  # Last number on a "TOTAL" line
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                try:
+                    val = float(match.replace(',', ''))
+                    if val > 0:
+                        return val
+                except:
+                    pass
+        return 0.0
 
     def _parse_header(self, text: str) -> InvoiceData:
         """Parse invoice header information"""
