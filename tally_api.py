@@ -127,47 +127,21 @@ class TallyAPI:
         return companies
 
     def ledger_exists(self, ledger_name: str) -> bool:
-        """Check if a ledger exists in Tally"""
+        """Check if a ledger exists in Tally - simplified for ERP 9 compatibility"""
         xml = f"""
         <ENVELOPE>
             <HEADER>
-                <VERSION>1</VERSION>
-                <TALLYREQUEST>Export</TALLYREQUEST>
-                <TYPE>Data</TYPE>
-                <ID>Ledger</ID>
+                <TALLYREQUEST>Export Data</TALLYREQUEST>
             </HEADER>
             <BODY>
-                <DESC>
-                    <STATICVARIABLES>
-                        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-                        <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
-                    </STATICVARIABLES>
-                    <TDL>
-                        <TDLMESSAGE>
-                            <REPORT NAME="LedgerCheck">
-                                <FORMS>LedgerCheckForm</FORMS>
-                            </REPORT>
-                            <FORM NAME="LedgerCheckForm">
-                                <PARTS>LedgerCheckPart</PARTS>
-                            </FORM>
-                            <PART NAME="LedgerCheckPart">
-                                <LINES>LedgerCheckLine</LINES>
-                                <REPEAT>LedgerCheckLine : LedgerCollection</REPEAT>
-                            </PART>
-                            <LINE NAME="LedgerCheckLine">
-                                <FIELDS>LedgerName</FIELDS>
-                            </LINE>
-                            <FIELD NAME="LedgerName">
-                                <SET>$Name</SET>
-                            </FIELD>
-                            <COLLECTION NAME="LedgerCollection">
-                                <TYPE>Ledger</TYPE>
-                                <FILTER>NameFilter</FILTER>
-                            </COLLECTION>
-                            <SYSTEM TYPE="Formulae" NAME="NameFilter">$Name = "{ledger_name}"</SYSTEM>
-                        </TDLMESSAGE>
-                    </TDL>
-                </DESC>
+                <EXPORTDATA>
+                    <REQUESTDESC>
+                        <REPORTNAME>List of Accounts</REPORTNAME>
+                        <STATICVARIABLES>
+                            <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
+                        </STATICVARIABLES>
+                    </REQUESTDESC>
+                </EXPORTDATA>
             </BODY>
         </ENVELOPE>
         """
@@ -176,49 +150,44 @@ class TallyAPI:
             response = self._send_request(xml)
             return ledger_name.upper() in response.upper()
         except (TallyConnectionError, TallyAPIError):
+            # If we can't check, assume it doesn't exist
             return False
 
     def create_ledger(self, name: str, group: str = "Sundry Creditors",
                       address: str = "", trn: str = "") -> bool:
         """
-        Create a new ledger in Tally
+        Create a new ledger in Tally - simplified XML for ERP 9 compatibility
         """
-        xml = f"""
-        <ENVELOPE>
-            <HEADER>
-                <TALLYREQUEST>Import Data</TALLYREQUEST>
-            </HEADER>
-            <BODY>
-                <IMPORTDATA>
-                    <REQUESTDESC>
-                        <REPORTNAME>All Masters</REPORTNAME>
-                        <STATICVARIABLES>
-                            <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
-                        </STATICVARIABLES>
-                    </REQUESTDESC>
-                    <REQUESTDATA>
-                        <TALLYMESSAGE xmlns:UDF="TallyUDF">
-                            <LEDGER NAME="{name}" ACTION="Create">
-                                <NAME>{name}</NAME>
-                                <PARENT>{group}</PARENT>
-                                <ADDRESS.LIST>
-                                    <ADDRESS>{address}</ADDRESS>
-                                </ADDRESS.LIST>
-                                <LEDSTATENAME></LEDSTATENAME>
-                                <COUNTRYNAME>United Arab Emirates</COUNTRYNAME>
-                                <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
-                                <PARTYGSTIN>{trn}</PARTYGSTIN>
-                            </LEDGER>
-                        </TALLYMESSAGE>
-                    </REQUESTDATA>
-                </IMPORTDATA>
-            </BODY>
-        </ENVELOPE>
-        """
+        # Escape special XML characters
+        name_escaped = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        xml = f"""<ENVELOPE>
+<HEADER>
+<TALLYREQUEST>Import Data</TALLYREQUEST>
+</HEADER>
+<BODY>
+<IMPORTDATA>
+<REQUESTDESC>
+<REPORTNAME>All Masters</REPORTNAME>
+<STATICVARIABLES>
+<SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
+</STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<LEDGER NAME="{name_escaped}" ACTION="Create">
+<NAME>{name_escaped}</NAME>
+<PARENT>{group}</PARENT>
+</LEDGER>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA>
+</BODY>
+</ENVELOPE>"""
 
         try:
             response = self._send_request(xml)
-            success = 'CREATED' in response.upper() or 'LINEERROR' not in response.upper()
+            success = 'CREATED' in response.upper() or ('LINEERROR' not in response.upper() and 'ERROR' not in response.upper())
             if success:
                 logger.info(f"Created ledger: {name}")
             else:
@@ -229,32 +198,21 @@ class TallyAPI:
             return False
 
     def stock_item_exists(self, item_name: str) -> bool:
-        """Check if a stock item exists in Tally"""
+        """Check if a stock item exists in Tally - simplified for ERP 9"""
         xml = f"""
         <ENVELOPE>
             <HEADER>
-                <VERSION>1</VERSION>
-                <TALLYREQUEST>Export</TALLYREQUEST>
-                <TYPE>Collection</TYPE>
-                <ID>StockItemCollection</ID>
+                <TALLYREQUEST>Export Data</TALLYREQUEST>
             </HEADER>
             <BODY>
-                <DESC>
-                    <STATICVARIABLES>
-                        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-                        <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
-                    </STATICVARIABLES>
-                    <TDL>
-                        <TDLMESSAGE>
-                            <COLLECTION NAME="StockItemCollection">
-                                <TYPE>StockItem</TYPE>
-                                <FILTER>ItemNameFilter</FILTER>
-                                <FETCH>NAME</FETCH>
-                            </COLLECTION>
-                            <SYSTEM TYPE="Formulae" NAME="ItemNameFilter">$Name = "{item_name}"</SYSTEM>
-                        </TDLMESSAGE>
-                    </TDL>
-                </DESC>
+                <EXPORTDATA>
+                    <REQUESTDESC>
+                        <REPORTNAME>List of Stock Items</REPORTNAME>
+                        <STATICVARIABLES>
+                            <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
+                        </STATICVARIABLES>
+                    </REQUESTDESC>
+                </EXPORTDATA>
             </BODY>
         </ENVELOPE>
         """
@@ -268,41 +226,38 @@ class TallyAPI:
     def create_stock_item(self, name: str, unit: str = "Nos",
                           group: str = "Primary", category: str = "") -> bool:
         """
-        Create a new stock item in Tally
+        Create a new stock item in Tally - simplified for ERP 9 compatibility
         """
-        xml = f"""
-        <ENVELOPE>
-            <HEADER>
-                <TALLYREQUEST>Import Data</TALLYREQUEST>
-            </HEADER>
-            <BODY>
-                <IMPORTDATA>
-                    <REQUESTDESC>
-                        <REPORTNAME>All Masters</REPORTNAME>
-                        <STATICVARIABLES>
-                            <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
-                        </STATICVARIABLES>
-                    </REQUESTDESC>
-                    <REQUESTDATA>
-                        <TALLYMESSAGE xmlns:UDF="TallyUDF">
-                            <STOCKITEM NAME="{name}" ACTION="Create">
-                                <NAME>{name}</NAME>
-                                <PARENT>{group}</PARENT>
-                                <CATEGORY>{category}</CATEGORY>
-                                <BASEUNITS>{unit}</BASEUNITS>
-                                <GSTAPPLICABLE>Applicable</GSTAPPLICABLE>
-                                <GSTTYPEOFSUPPLY>Goods</GSTTYPEOFSUPPLY>
-                            </STOCKITEM>
-                        </TALLYMESSAGE>
-                    </REQUESTDATA>
-                </IMPORTDATA>
-            </BODY>
-        </ENVELOPE>
-        """
+        # Escape special XML characters
+        name_escaped = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        xml = f"""<ENVELOPE>
+<HEADER>
+<TALLYREQUEST>Import Data</TALLYREQUEST>
+</HEADER>
+<BODY>
+<IMPORTDATA>
+<REQUESTDESC>
+<REPORTNAME>All Masters</REPORTNAME>
+<STATICVARIABLES>
+<SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
+</STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<STOCKITEM NAME="{name_escaped}" ACTION="Create">
+<NAME>{name_escaped}</NAME>
+<BASEUNITS>{unit}</BASEUNITS>
+</STOCKITEM>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA>
+</BODY>
+</ENVELOPE>"""
 
         try:
             response = self._send_request(xml)
-            success = 'CREATED' in response.upper() or 'LINEERROR' not in response.upper()
+            success = 'CREATED' in response.upper() or ('LINEERROR' not in response.upper() and 'ERROR' not in response.upper())
             if success:
                 logger.info(f"Created stock item: {name}")
             else:
@@ -351,73 +306,42 @@ class TallyAPI:
             return False
 
     def project_exists(self, project_name: str) -> bool:
-        """Check if a cost centre (project) exists"""
-        xml = f"""
-        <ENVELOPE>
-            <HEADER>
-                <VERSION>1</VERSION>
-                <TALLYREQUEST>Export</TALLYREQUEST>
-                <TYPE>Collection</TYPE>
-                <ID>CostCentreCollection</ID>
-            </HEADER>
-            <BODY>
-                <DESC>
-                    <STATICVARIABLES>
-                        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-                        <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
-                    </STATICVARIABLES>
-                    <TDL>
-                        <TDLMESSAGE>
-                            <COLLECTION NAME="CostCentreCollection">
-                                <TYPE>CostCentre</TYPE>
-                                <FILTER>ProjectFilter</FILTER>
-                                <FETCH>NAME</FETCH>
-                            </COLLECTION>
-                            <SYSTEM TYPE="Formulae" NAME="ProjectFilter">$Name = "{project_name}"</SYSTEM>
-                        </TDLMESSAGE>
-                    </TDL>
-                </DESC>
-            </BODY>
-        </ENVELOPE>
-        """
-
-        try:
-            response = self._send_request(xml)
-            return project_name.upper() in response.upper()
-        except (TallyConnectionError, TallyAPIError):
-            return False
+        """Check if a cost centre (project) exists - simplified for ERP 9"""
+        # For simplicity, always return False to create if not sure
+        # This avoids complex TDL queries that may crash ERP 9
+        return False
 
     def create_project(self, name: str, parent: str = "") -> bool:
-        """Create a cost centre (project) in Tally"""
-        xml = f"""
-        <ENVELOPE>
-            <HEADER>
-                <TALLYREQUEST>Import Data</TALLYREQUEST>
-            </HEADER>
-            <BODY>
-                <IMPORTDATA>
-                    <REQUESTDESC>
-                        <REPORTNAME>All Masters</REPORTNAME>
-                        <STATICVARIABLES>
-                            <SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
-                        </STATICVARIABLES>
-                    </REQUESTDESC>
-                    <REQUESTDATA>
-                        <TALLYMESSAGE xmlns:UDF="TallyUDF">
-                            <COSTCENTRE NAME="{name}" ACTION="Create">
-                                <NAME>{name}</NAME>
-                                <PARENT>{parent}</PARENT>
-                            </COSTCENTRE>
-                        </TALLYMESSAGE>
-                    </REQUESTDATA>
-                </IMPORTDATA>
-            </BODY>
-        </ENVELOPE>
-        """
+        """Create a cost centre (project) in Tally - simplified for ERP 9"""
+        name_escaped = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        xml = f"""<ENVELOPE>
+<HEADER>
+<TALLYREQUEST>Import Data</TALLYREQUEST>
+</HEADER>
+<BODY>
+<IMPORTDATA>
+<REQUESTDESC>
+<REPORTNAME>All Masters</REPORTNAME>
+<STATICVARIABLES>
+<SVCURRENTCOMPANY>{self.company}</SVCURRENTCOMPANY>
+</STATICVARIABLES>
+</REQUESTDESC>
+<REQUESTDATA>
+<TALLYMESSAGE xmlns:UDF="TallyUDF">
+<COSTCENTRE NAME="{name_escaped}" ACTION="Create">
+<NAME>{name_escaped}</NAME>
+</COSTCENTRE>
+</TALLYMESSAGE>
+</REQUESTDATA>
+</IMPORTDATA>
+</BODY>
+</ENVELOPE>"""
 
         try:
             response = self._send_request(xml)
-            success = 'CREATED' in response.upper() or 'LINEERROR' not in response.upper()
+            # If already exists, that's fine too
+            success = 'CREATED' in response.upper() or 'LINEERROR' not in response.upper() or 'ALREADY EXISTS' in response.upper()
             if success:
                 logger.info(f"Created project/cost centre: {name}")
             return success
