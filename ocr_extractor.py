@@ -231,6 +231,25 @@ class InvoiceOCR:
 
     def _extract_vendor_name(self, lines: List[str], text: str) -> str:
         """Extract vendor/company name from invoice"""
+        # Known vendor patterns from UAE invoices
+        known_vendors = [
+            r'(Media\s*General\s*Trading\s*(?:LLC|L\.L\.C)?)',
+            r'(Al\s*Junaibi\s*Building\s*Materials)',
+            r'(Laspinas\s*Building\s*Materials)',
+            r'(Mohammed\s*Sofa\s*(?:Elect(?:rical)?(?:\s*&)?\s*Sanitary\s*Ware)?)',
+            r'([A-Za-z\s]+Building\s*Materials)',
+            r'([A-Za-z\s]+Trading\s*(?:LLC|L\.L\.C)?)',
+        ]
+
+        for pattern in known_vendors:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Clean up
+                name = re.sub(r'\s+', ' ', name)
+                if len(name) > 5:
+                    return name
+
         # Common patterns for company names
         patterns = [
             r'(?:from|vendor|supplier|company)[\s:]+([A-Za-z\s&\.\-]+(?:LLC|L\.L\.C|Trading|Materials|Services|Est|CO|Company)?)',
@@ -240,15 +259,19 @@ class InvoiceOCR:
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
             if match:
-                return match.group(1).strip()
+                name = match.group(1).strip()
+                # Filter out common false positives
+                if not any(fp in name.upper() for fp in ['STAMP', 'SIGNATURE', 'AUTHORISED', 'CUSTOMER', 'ADDRESS']):
+                    return name
 
         # Fallback: Look for LLC or Trading in first few lines
-        for line in lines[:10]:
+        for line in lines[:15]:
             if any(keyword in line.upper() for keyword in ['LLC', 'L.L.C', 'TRADING', 'MATERIALS', 'EST.', 'CONTRACTING']):
                 # Clean up the line
                 name = re.sub(r'[\(\)]', '', line)
                 name = re.sub(r'\s+', ' ', name).strip()
-                if len(name) > 5:
+                # Filter out false positives
+                if len(name) > 5 and not any(fp in name.upper() for fp in ['STAMP', 'SIGNATURE', 'AUTHORISED', 'CUSTOMER']):
                     return name
 
         return ""
@@ -271,20 +294,46 @@ class InvoiceOCR:
 
     def _extract_date(self, text: str) -> str:
         """Extract invoice date"""
-        patterns = [
-            r'(?:date|dated|invoice date|inv date)[\s:]*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})',
-            r'(?:date|dated|invoice date|inv date)[\s:]*(\d{1,2}[-/][A-Za-z]{3}[-/]\d{2,4})',
-            r'(\d{1,2}[-/][A-Za-z]{3}[-/]\d{4})',
-            r'(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
+        # First try patterns with explicit "Date" keyword
+        date_patterns_with_keyword = [
+            r'(?:date|dated|invoice\s*date|inv\s*date)[\s:\.]*(\d{1,2}[-/\.]\s*[A-Za-z]{3}[-/\.]\s*\d{4})',
+            r'(?:date|dated|invoice\s*date|inv\s*date)[\s:\.]*(\d{1,2}[-/\.]\s*[A-Za-z]{3}[-/\.]\s*\d{2})',
+            r'(?:date|dated|invoice\s*date|inv\s*date)[\s:\.]*(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4})',
+            r'(?:date|dated|invoice\s*date|inv\s*date)[\s:\.]*(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2})',
         ]
 
-        for pattern in patterns:
+        for pattern in date_patterns_with_keyword:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                date_str = match.group(1)
-                # Normalize date format to DD-MMM-YYYY for Tally
-                return self._normalize_date(date_str)
+                date_str = match.group(1).replace(' ', '')
+                normalized = self._normalize_date(date_str)
+                if normalized and self._is_valid_date(normalized):
+                    return normalized
+
+        # Then try standalone date patterns (more restrictive)
+        standalone_patterns = [
+            r'(\d{1,2}[-/][A-Za-z]{3}[-/]\d{4})',  # 27-Mar-2024
+            r'(\d{1,2}[-/][A-Za-z]{3}[-/]\d{2})\b',  # 27-Mar-24
+        ]
+
+        for pattern in standalone_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for date_str in matches:
+                normalized = self._normalize_date(date_str)
+                if normalized and self._is_valid_date(normalized):
+                    return normalized
+
         return ""
+
+    def _is_valid_date(self, date_str: str) -> bool:
+        """Check if date is reasonable (not too far in past or future)"""
+        try:
+            dt = datetime.strptime(date_str, '%d-%b-%Y')
+            year = dt.year
+            # Accept dates from 2020 to 2030
+            return 2020 <= year <= 2030
+        except ValueError:
+            return False
 
     def _normalize_date(self, date_str: str) -> str:
         """Normalize date to Tally format (DD-MMM-YYYY)"""
