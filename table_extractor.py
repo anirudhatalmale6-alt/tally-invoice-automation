@@ -160,7 +160,6 @@ class TableInvoiceOCR:
             # Extract tables with OCR
             tables = doc.extract_tables(ocr=self.ocr,
                                          implicit_rows=True,
-                                         implicit_columns=True,
                                          borderless_tables=True,
                                          min_confidence=50)
 
