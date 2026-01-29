@@ -1,6 +1,6 @@
 """
 Table Detection OCR Module for Invoice Processing
-Uses img2table for structured table extraction from scanned invoices
+Uses OpenCV for table detection and Tesseract for OCR
 """
 
 import os
@@ -9,13 +9,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from datetime import datetime
 import logging
-
-try:
-    from img2table.document import Image as Img2TableImage, PDF as Img2TablePDF
-    from img2table.ocr import TesseractOCR
-    IMG2TABLE_AVAILABLE = True
-except ImportError:
-    IMG2TABLE_AVAILABLE = False
 
 try:
     import cv2
@@ -78,19 +71,15 @@ class InvoiceData:
 
 class TableInvoiceOCR:
     """
-    Invoice OCR using table detection for accurate item extraction
+    Invoice OCR using OpenCV table detection and Tesseract
     """
 
     def __init__(self):
         if not TESSERACT_AVAILABLE:
             raise RuntimeError("Tesseract is required. Install pytesseract.")
-
-        if IMG2TABLE_AVAILABLE:
-            self.ocr = TesseractOCR(n_threads=1, lang="eng")
-            logger.info("img2table initialized with Tesseract OCR")
-        else:
-            logger.warning("img2table not available - using fallback extraction")
-            self.ocr = None
+        if not CV2_AVAILABLE:
+            raise RuntimeError("OpenCV is required. Install opencv-python.")
+        logger.info("Table OCR initialized with OpenCV and Tesseract")
 
     def extract_from_file(self, file_path: str) -> InvoiceData:
         """Extract invoice data from a file"""
@@ -100,235 +89,281 @@ class TableInvoiceOCR:
         voucher_number = os.path.splitext(os.path.basename(file_path))[0]
         ext = os.path.splitext(file_path)[1].lower()
 
-        # Get full text for header extraction
-        full_text = self._get_full_text(file_path)
+        # Load image(s)
+        images = self._load_images(file_path, ext)
 
-        # Extract table data
-        if IMG2TABLE_AVAILABLE and self.ocr:
-            items = self._extract_table_items(file_path, ext)
-        else:
-            items = self._extract_items_fallback(full_text)
+        # Get full text for header extraction
+        full_text = ""
+        all_items = []
+
+        for img in images:
+            # Get full page OCR text
+            text = pytesseract.image_to_string(img)
+            full_text += text + "\n"
+
+            # Try to extract table items using line-by-line OCR with position info
+            items = self._extract_items_with_positions(img, text)
+            all_items.extend(items)
 
         # Parse header information
         invoice = self._parse_header(full_text)
         invoice.voucher_number = voucher_number
         invoice.attachment_path = file_path
-        invoice.items = items
+        invoice.items = all_items
         invoice.raw_text = full_text
 
         # Calculate totals if not found
-        if invoice.total_amount == 0 and items:
-            invoice.total_amount = sum(item.amount for item in items)
+        if invoice.total_amount == 0 and all_items:
+            invoice.total_amount = sum(item.amount for item in all_items)
 
-        # Set confidence
-        invoice.ocr_confidence = 85.0 if items else 50.0
-        invoice.needs_review = len(items) == 0
-
-        if not items:
+        # Set confidence based on extraction success
+        if all_items:
+            invoice.ocr_confidence = 85.0
+            invoice.needs_review = False
+        else:
+            invoice.ocr_confidence = 50.0
+            invoice.needs_review = True
             invoice.extraction_notes.append("No items extracted - manual review needed")
 
         return invoice
 
-    def _get_full_text(self, file_path: str) -> str:
-        """Get full OCR text from document"""
-        ext = os.path.splitext(file_path)[1].lower()
+    def _load_images(self, file_path: str, ext: str) -> List[np.ndarray]:
+        """Load images from file"""
+        images = []
 
         if ext == '.pdf':
             if PDF2IMAGE_AVAILABLE:
-                images = pdf2image.convert_from_path(file_path, dpi=300)
-                texts = []
-                for img in images:
-                    text = pytesseract.image_to_string(img)
-                    texts.append(text)
-                return "\n".join(texts)
+                pil_images = pdf2image.convert_from_path(file_path, dpi=300)
+                for pil_img in pil_images:
+                    img_array = np.array(pil_img)
+                    # Convert RGB to BGR for OpenCV
+                    if len(img_array.shape) == 3:
+                        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                    images.append(img_array)
         else:
-            img = Image.open(file_path)
-            return pytesseract.image_to_string(img)
+            img = cv2.imread(file_path)
+            if img is not None:
+                images.append(img)
 
-        return ""
+        return images
 
-    def _extract_table_items(self, file_path: str, ext: str) -> List[InvoiceItem]:
-        """Extract items using img2table table detection"""
+    def _extract_items_with_positions(self, img: np.ndarray, full_text: str) -> List[InvoiceItem]:
+        """Extract items using OCR with position data to maintain table structure"""
         items = []
 
-        try:
-            if ext == '.pdf':
-                doc = Img2TablePDF(src=file_path)
-            else:
-                doc = Img2TableImage(src=file_path)
+        # Convert to grayscale for better OCR
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
 
-            # Extract tables with OCR - handle different API versions
-            tables = None
-            try:
-                tables = doc.extract_tables(ocr=self.ocr)
-            except Exception as e:
-                logger.warning(f"Table extraction error: {e}")
+        # Get OCR data with positions
+        pil_img = Image.fromarray(gray)
+        ocr_data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
 
-            if tables is None:
-                tables = []
-            logger.info(f"Found {len(tables)} tables in document")
+        # Group words by line (similar y-coordinates)
+        lines = self._group_words_by_line(ocr_data)
 
-            for table in tables:
-                if hasattr(table, 'df') and table.df is not None:
-                    df = table.df
-                    logger.info(f"Table shape: {df.shape}")
-                    logger.info(f"Table columns: {list(df.columns)}")
+        logger.info(f"Found {len(lines)} text lines in document")
 
-                    # Process each row
-                    for idx, row in df.iterrows():
-                        item = self._parse_table_row(row)
-                        if item:
-                            items.append(item)
+        # Process each line to find item rows
+        for line_words in lines:
+            line_text = ' '.join([w['text'] for w in line_words])
+            item = self._parse_item_line(line_text, line_words)
+            if item:
+                items.append(item)
 
-        except Exception as e:
-            logger.warning(f"Table extraction failed: {e}")
-            # Will fall back to text-based extraction
+        # If no items found with position-based extraction, try pattern matching on full text
+        if not items:
+            items = self._extract_items_from_text(full_text)
 
         return items
 
-    def _parse_table_row(self, row) -> Optional[InvoiceItem]:
-        """Parse a table row into an InvoiceItem"""
-        try:
-            values = [str(v).strip() for v in row.values if str(v).strip()]
+    def _group_words_by_line(self, ocr_data: dict) -> List[List[dict]]:
+        """Group OCR words by line based on y-coordinate"""
+        words = []
+        n_boxes = len(ocr_data['text'])
 
-            if len(values) < 3:
-                return None
+        for i in range(n_boxes):
+            text = ocr_data['text'][i].strip()
+            if text and int(ocr_data['conf'][i]) > 30:  # Filter low confidence
+                words.append({
+                    'text': text,
+                    'x': ocr_data['left'][i],
+                    'y': ocr_data['top'][i],
+                    'w': ocr_data['width'][i],
+                    'h': ocr_data['height'][i],
+                    'conf': int(ocr_data['conf'][i])
+                })
 
-            # Skip header rows
-            header_words = ['item', 'description', 'qty', 'quantity', 'rate', 'amount',
-                           'unit', 'price', 'sl', 'no', 'code', 'total', 'vat', 'tax']
-            if any(hw in ' '.join(values).lower() for hw in header_words):
-                return None
+        if not words:
+            return []
 
-            # Try to identify columns
-            item_code = ""
-            description = ""
-            quantity = 0.0
-            unit = "NOS"
-            rate = 0.0
-            amount = 0.0
+        # Sort by y-coordinate
+        words.sort(key=lambda w: w['y'])
 
-            numbers = []
-            texts = []
+        # Group words with similar y-coordinates (within threshold)
+        lines = []
+        current_line = [words[0]]
+        y_threshold = 15  # pixels
 
-            for v in values:
-                # Check if it's a number
-                clean_v = v.replace(',', '').replace(' ', '')
-                try:
-                    num = float(clean_v)
-                    numbers.append(num)
-                except ValueError:
-                    # Check if it's an item code (4-5 digit number at start)
-                    if re.match(r'^\d{4,6}$', v):
-                        item_code = v
-                    # Check if it's a unit
-                    elif v.upper() in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'EA', 'EACH', 'UNIT']:
-                        unit = v.upper()
-                    else:
-                        texts.append(v)
+        for word in words[1:]:
+            if abs(word['y'] - current_line[0]['y']) < y_threshold:
+                current_line.append(word)
+            else:
+                # Sort line by x-coordinate
+                current_line.sort(key=lambda w: w['x'])
+                lines.append(current_line)
+                current_line = [word]
 
-            # Assign description from texts
-            if texts:
-                description = ' '.join(texts)
-                # Clean up description
-                description = re.sub(r'\s+', ' ', description).strip()
+        if current_line:
+            current_line.sort(key=lambda w: w['x'])
+            lines.append(current_line)
 
-            # Assign numbers (typically: qty, rate, amount or just amount)
-            if len(numbers) >= 3:
-                quantity = numbers[-3]
-                rate = numbers[-2]
-                amount = numbers[-1]
-            elif len(numbers) == 2:
-                quantity = numbers[0]
-                amount = numbers[1]
-            elif len(numbers) == 1:
-                amount = numbers[0]
+        return lines
 
-            # Validate
-            if not description or len(description) < 3:
-                return None
+    def _parse_item_line(self, line_text: str, line_words: List[dict]) -> Optional[InvoiceItem]:
+        """Parse a line of text to extract item information"""
+        # Skip header/footer lines
+        skip_patterns = ['item', 'code', 'description', 'qty', 'quantity', 'rate', 'amount',
+                        'unit', 'price', 'sl', 'no.', 'total', 'subtotal', 'vat', 'tax',
+                        'discount', 'net', 'grand', 'five hundred', 'iban', 'bank', 'a/c',
+                        'signature', 'stamp', 'receiver', 'customer', 'date', 'invoice',
+                        'trn', 'sold goods', 'exchange', 'return', 'condition', 'delivery',
+                        'declare', 'dispute', 'authorised']
 
-            # Skip if looks like totals or footer
-            skip_words = ['total', 'subtotal', 'vat', 'tax', 'discount', 'net amount',
-                         'grand total', 'five hundred', 'iban', 'bank', 'signature']
-            if any(sw in description.lower() for sw in skip_words):
-                return None
-
-            # Skip if amount is too large (likely IBAN or account number)
-            if amount > 100000:
-                return None
-
-            return InvoiceItem(
-                item_code=item_code,
-                description=description,
-                quantity=quantity if quantity > 0 else 1.0,
-                unit=unit,
-                rate=rate,
-                amount=amount
-            )
-
-        except Exception as e:
-            logger.debug(f"Failed to parse row: {e}")
+        line_lower = line_text.lower()
+        if any(skip in line_lower for skip in skip_patterns):
             return None
 
-    def _extract_items_fallback(self, text: str) -> List[InvoiceItem]:
-        """Fallback extraction when table detection fails"""
+        # Extract numbers from the line
+        numbers = re.findall(r'(\d+\.?\d*)', line_text)
+        numbers = [float(n) for n in numbers]
+
+        # Filter out unreasonable numbers (too large = likely IBAN, phone numbers)
+        numbers = [n for n in numbers if n < 100000]
+
+        # Need at least some numbers for qty/rate/amount
+        if len(numbers) < 2:
+            return None
+
+        # Try to find item description (text that's not just numbers)
+        description_parts = []
+        for word in line_words:
+            text = word['text']
+            # Keep text that's not purely numeric and not a unit
+            if not re.match(r'^[\d\.,]+$', text):
+                if text.upper() not in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'EA', 'EACH', 'UNIT']:
+                    description_parts.append(text)
+
+        description = ' '.join(description_parts)
+
+        # Check for item code at the beginning (4-6 digit number)
+        item_code = ""
+        code_match = re.match(r'^(\d{4,6})\s+', line_text)
+        if code_match:
+            item_code = code_match.group(1)
+
+        # Find unit
+        unit = "NOS"
+        unit_match = re.search(r'\b(NOS|PCS|KG|MTR|LTR|DRUM|BOX|SET|EA|EACH|UNIT)\b', line_text, re.IGNORECASE)
+        if unit_match:
+            unit = unit_match.group(1).upper()
+
+        # Clean up description
+        description = re.sub(r'\d{4,6}', '', description)  # Remove item codes
+        description = re.sub(r'\b(NOS|PCS|KG|MTR|LTR|DRUM|BOX|SET|EA|EACH|UNIT)\b', '', description, flags=re.IGNORECASE)
+        description = re.sub(r'\s+', ' ', description).strip()
+
+        # Need a meaningful description
+        if len(description) < 3:
+            return None
+
+        # Assign numbers: typically last number is amount, second to last is rate, third to last is qty
+        qty = 1.0
+        rate = 0.0
+        amount = 0.0
+
+        if len(numbers) >= 3:
+            qty = numbers[-3]
+            rate = numbers[-2]
+            amount = numbers[-1]
+        elif len(numbers) == 2:
+            qty = numbers[0]
+            amount = numbers[1]
+            if qty > 0:
+                rate = amount / qty
+        elif len(numbers) == 1:
+            amount = numbers[0]
+
+        # Validate: qty should be reasonable
+        if qty > 10000 or amount > 50000:
+            return None
+
+        return InvoiceItem(
+            item_code=item_code,
+            description=description,
+            quantity=qty,
+            unit=unit,
+            rate=rate,
+            amount=amount
+        )
+
+    def _extract_items_from_text(self, text: str) -> List[InvoiceItem]:
+        """Fallback: Extract items using pattern matching on full text"""
         items = []
 
-        # Known item patterns
-        known_items = [
-            'Bitumen Polycoat',
-            'NOORA BRUSH',
-            'Paint Roller',
-            'Cement Spacer',
-            'PVC BUCKET',
-            'PYC BUCKET',
+        # Pattern: Item code + Description + numbers
+        # Example: "14504 Bitumen Polycoat WB 200ltr Henkel DRUM 1.00 330.00 330.00"
+        patterns = [
+            # Pattern with item code
+            r'(\d{4,6})\s+([A-Za-z][A-Za-z\s\d\-\./\'\"]+?)\s+(DRUM|NOS|PCS|KG|MTR|LTR|BOX|SET)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
+            # Pattern without item code
+            r'([A-Za-z][A-Za-z\s\d\-\./\'\"]{5,30}?)\s+(DRUM|NOS|PCS|KG|MTR|LTR|BOX|SET)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)',
         ]
 
-        for known in known_items:
-            if known.lower() in text.lower():
-                # Try to find the full line
-                pattern = rf'({re.escape(known)}[^\n]*)'
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    line = match.group(1)
-                    # Extract numbers from line
-                    numbers = re.findall(r'(\d+\.?\d*)', line)
-                    numbers = [float(n) for n in numbers if float(n) < 100000]
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                try:
+                    if len(match) == 6:
+                        item_code, description, unit, qty, rate, amount = match
+                    else:
+                        item_code = ""
+                        description, unit, qty, rate, amount = match
+
+                    # Skip if looks like header/footer
+                    if any(skip in description.lower() for skip in ['total', 'subtotal', 'vat', 'tax', 'iban']):
+                        continue
 
                     item = InvoiceItem(
-                        description=known,
-                        quantity=numbers[0] if len(numbers) > 0 else 1.0,
-                        rate=numbers[-2] if len(numbers) >= 2 else 0.0,
-                        amount=numbers[-1] if len(numbers) >= 1 else 0.0,
-                        unit="NOS"
+                        item_code=str(item_code).strip(),
+                        description=description.strip(),
+                        quantity=float(qty),
+                        unit=unit.upper(),
+                        rate=float(rate),
+                        amount=float(amount)
                     )
                     items.append(item)
+                except (ValueError, IndexError):
+                    continue
+
+            if items:
+                break
 
         return items
 
     def _parse_header(self, text: str) -> InvoiceData:
         """Parse invoice header information"""
         invoice = InvoiceData()
-
-        # Vendor name
         invoice.vendor_name = self._extract_vendor(text)
-
-        # Date
         invoice.invoice_date = self._extract_date(text)
-
-        # TRN
         invoice.vendor_trn = self._extract_trn(text)
-
-        # Totals
         invoice.total_amount = self._extract_amount(text, ['net amount', 'total', 'grand total'])
         invoice.vat_amount = self._extract_amount(text, ['vat', 'tax 5%', 'vat 5%'])
         invoice.discount = self._extract_amount(text, ['discount'])
         invoice.subtotal = self._extract_amount(text, ['subtotal', 'sub total'])
-
-        # Project
         invoice.project_name = self._extract_project(text)
-
         return invoice
 
     def _extract_vendor(self, text: str) -> str:
@@ -341,7 +376,6 @@ class TableInvoiceOCR:
             r'([A-Za-z\s]+Building\s*Materials)',
             r'([A-Za-z\s]+Trading\s*(?:LLC)?)',
         ]
-
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
@@ -358,7 +392,6 @@ class TableInvoiceOCR:
             r'Date\s*:?\s*(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
             r'(\d{1,2}[-/][A-Za-z]{3}[-/]\d{4})',
         ]
-
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
@@ -372,7 +405,6 @@ class TableInvoiceOCR:
             '%d-%b-%Y', '%d/%b/%Y', '%d-%m-%Y', '%d/%m/%Y',
             '%d-%b-%y', '%d/%b/%y', '%d-%m-%y', '%d/%m/%y',
         ]
-
         for fmt in formats:
             try:
                 dt = datetime.strptime(date_str, fmt)
@@ -409,7 +441,6 @@ class TableInvoiceOCR:
             r'project\s*:?\s*([A-Za-z0-9\s\-]+)',
             r'site\s*:?\s*([A-Za-z0-9\s\-]+)',
         ]
-
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
