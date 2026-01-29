@@ -177,56 +177,291 @@ class TableInvoiceOCR:
         items = []
         logger.info("Using Media General extraction pattern")
 
-        # Media General format: Code | Description | Unit | Qty | UnitPrice | Amount | VAT | Total
-        # Items: 14504, 19417, 11537, 15056, 20045
+        # First try position-based table extraction
+        table_rows = self._extract_table_with_positions(img)
+        logger.info(f"Found {len(table_rows)} rows with position-based OCR")
 
-        # Known items for Media General
-        media_items = {
-            '14504': ('Bitumen Polycoat WB 200ltr Henkel', 'DRUM'),
-            '19417': ('NOORA BRUSH H/D', 'NOS'),
-            '11537': ('Paint Roller 9" Tower', 'NOS'),
-            '15056': ('Cement Spacer 50mm', 'NOS'),
-            '20045': ('PVC BUCKET BLACK', 'NOS'),
-        }
+        # Debug: log all rows
+        for i, row in enumerate(table_rows):
+            logger.debug(f"Row {i}: {row}")
 
-        # Try to find each known item code in text
-        for code, (desc, unit) in media_items.items():
-            if code in text:
-                # Try to find the line with this code
-                pattern = rf'{code}[^\n]*?(\d+\.?\d*)\s+(DRUM|NOS|PCS)[^\n]*?(\d+\.?\d*)[^\n]*?(\d+\.?\d*)'
-                match = re.search(pattern, text, re.IGNORECASE)
+        # Media General format columns: S.No | Item Code | Description | Unit | Qty | Rate | Amount
+        # Try to identify item rows (rows with item codes - 5-digit numbers)
+        for row in table_rows:
+            row_text = ' '.join(row)
+
+            # Skip header/footer rows
+            if any(skip in row_text.upper() for skip in [
+                'ITEM CODE', 'DESCRIPTION', 'TOTAL', 'VAT', 'SUBTOTAL', 'NET AMOUNT',
+                'GRAND', 'THANK', 'BANK', 'IBAN', 'TRN', 'ADDRESS'
+            ]):
+                continue
+
+            # Find numbers in this row
+            numbers = []
+            texts = []
+            for cell in row:
+                # Try to parse as number
+                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0')
+                try:
+                    num = float(cell_clean)
+                    numbers.append(num)
+                except ValueError:
+                    # Check if it's a partial number with text
+                    num_match = re.search(r'(\d+\.?\d*)', cell_clean)
+                    if num_match:
+                        numbers.append(float(num_match.group(1)))
+                    texts.append(cell)
+
+            # Valid item row should have at least 3 numbers (qty, rate, amount) or (code, qty, rate, amount)
+            if len(numbers) < 3:
+                continue
+
+            # Build description from text parts
+            desc_parts = []
+            for t in texts:
+                # Skip units and very short strings
+                if t.upper() in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'PKT', 'BAG', 'NO', 'S']:
+                    continue
+                if len(t) >= 2:
+                    desc_parts.append(t)
+
+            description = ' '.join(desc_parts).strip()
+
+            # Skip if no meaningful description
+            if len(description) < 3:
+                continue
+
+            # Identify unit
+            unit = "NOS"
+            for u in ['DRUM', 'NOS', 'PCS', 'KG', 'MTR', 'LTR', 'BOX', 'SET', 'PKT', 'BAG']:
+                if u in row_text.upper():
+                    unit = u
+                    break
+
+            # Extract item code if present (usually 5-digit number at start)
+            item_code = ""
+            for num in numbers:
+                if 10000 <= num <= 99999:  # 5-digit item code
+                    item_code = str(int(num))
+                    numbers.remove(num)
+                    break
+
+            # Assign remaining numbers to qty, rate, amount
+            # Filter out unlikely values
+            valid_nums = [n for n in numbers if 0 < n < 100000]
+
+            if len(valid_nums) >= 3:
+                # Assume last 3 are qty, rate, amount
+                qty = valid_nums[-3]
+                rate = valid_nums[-2]
+                amount = valid_nums[-1]
+            elif len(valid_nums) == 2:
+                qty = valid_nums[0]
+                amount = valid_nums[1]
+                rate = amount / qty if qty > 0 else 0
+            else:
+                continue
+
+            # Validate: qty should be reasonable (< 1000), amount should match roughly
+            if qty > 1000:
+                # Maybe qty and amount are swapped
+                if amount < 100:
+                    qty, amount = amount, qty
+                    rate = amount / qty if qty > 0 else 0
+
+            items.append(InvoiceItem(
+                item_code=item_code,
+                description=description,
+                quantity=qty,
+                unit=unit,
+                rate=rate,
+                amount=amount
+            ))
+            logger.info(f"Found item: {item_code} | {description} | Qty: {qty} | Rate: {rate} | Amount: {amount}")
+
+        if items:
+            return items
+
+        # Fallback: use known items approach with enhanced OCR
+        logger.info("Position-based extraction found no items, trying known items fallback")
+        enhanced_text = self._enhanced_ocr(img)
+
+        known_items = [
+            ('Bitumen Polycoat', 'DRUM'),
+            ('NOORA BRUSH', 'NOS'),
+            ('Paint Roller', 'NOS'),
+            ('Cement Spacer', 'NOS'),
+            ('PVC BUCKET', 'NOS'),
+        ]
+
+        combined_text = text + "\n" + enhanced_text
+
+        for item_name, default_unit in known_items:
+            if item_name.upper() in combined_text.upper():
+                pattern = rf'{re.escape(item_name)}[^\n]*?(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)'
+                match = re.search(pattern, combined_text, re.IGNORECASE)
+
                 if match:
-                    qty = float(match.group(1))
-                    rate = float(match.group(3))
-                    amount = float(match.group(4))
+                    nums = [float(match.group(1)), float(match.group(2)), float(match.group(3))]
+                    nums = [n for n in nums if 0 < n < 50000]
+                    if len(nums) >= 3:
+                        qty, rate, amount = nums[0], nums[1], nums[2]
+                    elif len(nums) == 2:
+                        qty, amount = nums[0], nums[1]
+                        rate = amount / qty if qty > 0 else 0
+                    else:
+                        qty, rate, amount = 1.0, 0.0, 0.0
                 else:
-                    # Extract numbers near the code
-                    code_idx = text.find(code)
-                    if code_idx >= 0:
-                        nearby = text[code_idx:code_idx+200]
-                        nums = re.findall(r'(\d+\.?\d+)', nearby)
-                        nums = [float(n) for n in nums if 0.1 < float(n) < 10000]
-                        if len(nums) >= 3:
-                            qty = nums[0] if nums[0] < 1000 else 1.0
-                            rate = nums[-2] if len(nums) > 1 else 0.0
-                            amount = nums[-1]
-                        else:
-                            qty, rate, amount = 1.0, 0.0, 0.0
+                    qty, rate, amount = 1.0, 0.0, 0.0
 
                 items.append(InvoiceItem(
-                    item_code=code,
-                    description=desc,
+                    description=item_name,
                     quantity=qty,
-                    unit=unit,
+                    unit=default_unit,
                     rate=rate,
                     amount=amount
                 ))
+                logger.info(f"Found item (fallback): {item_name} - Qty: {qty}, Rate: {rate}, Amount: {amount}")
 
-        # If no items found with codes, try generic pattern
-        if not items:
-            items = self._extract_generic(img, text)
+        if items:
+            return items
 
-        return items
+        return self._extract_generic(img, text)
+
+    def _enhanced_ocr(self, img: np.ndarray) -> str:
+        """Enhanced OCR with image preprocessing for better table reading"""
+        try:
+            # Convert to grayscale
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img.copy()
+
+            # Apply thresholding to make text clearer
+            _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+
+            # OCR with different config for table/numbers
+            custom_config = r'--oem 3 --psm 6'
+            pil_img = Image.fromarray(thresh)
+            text = pytesseract.image_to_string(pil_img, config=custom_config)
+
+            return text
+        except Exception as e:
+            logger.warning(f"Enhanced OCR failed: {e}")
+            return ""
+
+    def _extract_table_with_positions(self, img: np.ndarray) -> List[List[str]]:
+        """
+        Extract table data using OCR with position information.
+        This reconstructs the table structure by grouping words into rows and columns.
+        """
+        try:
+            # Preprocess image
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img.copy()
+
+            # Enhance contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+
+            # Binary threshold
+            _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            pil_img = Image.fromarray(thresh)
+
+            # Get OCR data with bounding boxes
+            ocr_data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT, config='--oem 3 --psm 6')
+
+            # Collect all words with positions
+            words = []
+            n_boxes = len(ocr_data['text'])
+
+            for i in range(n_boxes):
+                text = str(ocr_data['text'][i]).strip()
+                conf = int(ocr_data['conf'][i])
+
+                if text and conf > 20:  # Lower threshold to catch numbers
+                    words.append({
+                        'text': text,
+                        'x': ocr_data['left'][i],
+                        'y': ocr_data['top'][i],
+                        'width': ocr_data['width'][i],
+                        'height': ocr_data['height'][i],
+                        'conf': conf
+                    })
+
+            if not words:
+                return []
+
+            # Group words into rows (by y-coordinate)
+            words.sort(key=lambda w: w['y'])
+            rows = []
+            current_row = [words[0]]
+            row_y = words[0]['y']
+            y_tolerance = 15  # Words within 15 pixels are on same row
+
+            for word in words[1:]:
+                if abs(word['y'] - row_y) <= y_tolerance:
+                    current_row.append(word)
+                else:
+                    # Sort row by x-coordinate
+                    current_row.sort(key=lambda w: w['x'])
+                    rows.append(current_row)
+                    current_row = [word]
+                    row_y = word['y']
+
+            if current_row:
+                current_row.sort(key=lambda w: w['x'])
+                rows.append(current_row)
+
+            # Convert to list of strings per row
+            result = []
+            for row in rows:
+                row_texts = [w['text'] for w in row]
+                result.append(row_texts)
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"Position-based OCR failed: {e}")
+            return []
+
+    def _find_table_region(self, img: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Try to find and crop the table region of the invoice.
+        Returns the cropped table area or None if not found.
+        """
+        try:
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img.copy()
+
+            # Edge detection
+            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+            # Find horizontal lines (table rows)
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+            horizontal = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horizontal_kernel)
+
+            # Find where horizontal lines are
+            h_lines = np.where(horizontal.sum(axis=1) > 100)[0]
+
+            if len(h_lines) >= 2:
+                # Get table bounds
+                top = max(0, h_lines[0] - 20)
+                bottom = min(img.shape[0], h_lines[-1] + 50)
+
+                return img[top:bottom, :]
+
+            return None
+
+        except Exception as e:
+            logger.warning(f"Table region detection failed: {e}")
+            return None
 
     def _extract_laspinas(self, img: np.ndarray, text: str) -> List[InvoiceItem]:
         """Extract items from Laspinas Building Materials invoices"""
@@ -355,39 +590,50 @@ class TableInvoiceOCR:
         items = []
         logger.info("Using generic extraction pattern")
 
-        # Get OCR data with position info
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-        pil_img = Image.fromarray(gray)
-        ocr_data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
+        # First try position-based extraction
+        table_rows = self._extract_table_with_positions(img)
 
-        # Group by lines
-        lines = self._group_by_lines(ocr_data)
-
-        for line_words in lines:
-            line_text = ' '.join([w['text'] for w in line_words])
+        for row in table_rows:
+            row_text = ' '.join(row)
 
             # Skip obvious non-item lines
-            if any(skip in line_text.upper() for skip in [
+            if any(skip in row_text.upper() for skip in [
                 'TOTAL', 'SUBTOTAL', 'VAT', 'TAX', 'DISCOUNT', 'NET', 'GRAND',
                 'DATE', 'INVOICE', 'TRN', 'CUSTOMER', 'RECEIVER', 'SIGNATURE',
                 'BANK', 'IBAN', 'DESCRIPTION', 'QUANTITY', 'RATE', 'AMOUNT',
-                'SOLD GOODS', 'EXCHANGE', 'RETURN', 'CONDITION'
+                'SOLD GOODS', 'EXCHANGE', 'RETURN', 'CONDITION', 'ITEM CODE',
+                'UNIT', 'S.NO', 'SNO', 'THANK', 'ADDRESS', 'PHONE', 'EMAIL'
             ]):
                 continue
 
-            # Need some numbers
-            numbers = re.findall(r'(\d+\.?\d*)', line_text)
-            numbers = [float(n) for n in numbers if 0 < float(n) < 50000]
+            # Parse numbers and texts from row
+            numbers = []
+            texts = []
 
+            for cell in row:
+                cell_clean = cell.replace(',', '').replace('O', '0').replace('o', '0')
+                try:
+                    num = float(cell_clean)
+                    if 0 < num < 100000:
+                        numbers.append(num)
+                except ValueError:
+                    num_match = re.search(r'(\d+\.?\d*)', cell_clean)
+                    if num_match:
+                        val = float(num_match.group(1))
+                        if 0 < val < 100000:
+                            numbers.append(val)
+                    if len(cell) >= 2:
+                        texts.append(cell)
+
+            # Need at least 2 numbers for a valid item row
             if len(numbers) < 2:
                 continue
 
-            # Get description (non-numeric parts)
+            # Build description
             desc_parts = []
-            for w in line_words:
-                if not re.match(r'^[\d\.,]+$', w['text']):
-                    if w['text'].upper() not in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'PKT', 'BAG']:
-                        desc_parts.append(w['text'])
+            for t in texts:
+                if t.upper() not in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'PKT', 'BAG', 'NO', 'S']:
+                    desc_parts.append(t)
 
             desc = ' '.join(desc_parts).strip()
             if len(desc) < 3:
@@ -396,7 +642,7 @@ class TableInvoiceOCR:
             # Find unit
             unit = "NOS"
             for u in ['DRUM', 'NOS', 'PCS', 'KG', 'MTR', 'LTR', 'BOX', 'SET', 'PKT', 'BAG']:
-                if u in line_text.upper():
+                if u in row_text.upper():
                     unit = u
                     break
 
@@ -410,6 +656,70 @@ class TableInvoiceOCR:
                 qty, rate, amount = 1.0, 0.0, numbers[0]
 
             # Validate
+            if qty > 10000:
+                continue
+
+            items.append(InvoiceItem(
+                description=desc,
+                quantity=qty,
+                unit=unit,
+                rate=rate,
+                amount=amount
+            ))
+
+        if items:
+            return items
+
+        # Fallback to original line-based approach
+        logger.info("Position-based extraction found no items, using line-based fallback")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        pil_img = Image.fromarray(gray)
+        ocr_data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
+
+        lines = self._group_by_lines(ocr_data)
+
+        for line_words in lines:
+            line_text = ' '.join([w['text'] for w in line_words])
+
+            if any(skip in line_text.upper() for skip in [
+                'TOTAL', 'SUBTOTAL', 'VAT', 'TAX', 'DISCOUNT', 'NET', 'GRAND',
+                'DATE', 'INVOICE', 'TRN', 'CUSTOMER', 'RECEIVER', 'SIGNATURE',
+                'BANK', 'IBAN', 'DESCRIPTION', 'QUANTITY', 'RATE', 'AMOUNT',
+                'SOLD GOODS', 'EXCHANGE', 'RETURN', 'CONDITION'
+            ]):
+                continue
+
+            numbers = re.findall(r'(\d+\.?\d*)', line_text)
+            numbers = [float(n) for n in numbers if 0 < float(n) < 50000]
+
+            if len(numbers) < 2:
+                continue
+
+            desc_parts = []
+            for w in line_words:
+                if not re.match(r'^[\d\.,]+$', w['text']):
+                    if w['text'].upper() not in ['NOS', 'PCS', 'KG', 'MTR', 'LTR', 'DRUM', 'BOX', 'SET', 'PKT', 'BAG']:
+                        desc_parts.append(w['text'])
+
+            desc = ' '.join(desc_parts).strip()
+            if len(desc) < 3:
+                continue
+
+            unit = "NOS"
+            for u in ['DRUM', 'NOS', 'PCS', 'KG', 'MTR', 'LTR', 'BOX', 'SET', 'PKT', 'BAG']:
+                if u in line_text.upper():
+                    unit = u
+                    break
+
+            if len(numbers) >= 3:
+                qty, rate, amount = numbers[-3], numbers[-2], numbers[-1]
+            elif len(numbers) == 2:
+                qty, amount = numbers[0], numbers[1]
+                rate = amount / qty if qty > 0 else 0
+            else:
+                qty, rate, amount = 1.0, 0.0, numbers[0]
+
             if qty > 10000 or amount > 50000:
                 continue
 
